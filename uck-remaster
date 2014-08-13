@@ -1,0 +1,546 @@
+#!/bin/bash
+
+###################################################################################
+# UCK2 - Ubuntu Customization Kit
+# Copyright (C) 2014 Amr Ayman
+
+# UCK2 is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation ..
+
+# That said, UCK2 is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with UCK2.  If not, see <http://www.gnu.org/licenses/>.
+
+# Explanation:
+#
+#	squashfs -- the compressed file that is run as your filesystem on live boot
+#		(thus, its software will be installed on installation)
+
+#	squashfs is readonly -- that's why we need to unpack it, then repack it
+
+#	the ubuntu iso might be readonly -- so the mount dir contents might be readonly
+#		that's why we mount the iso, copy its contents and then unmount it again ..
+#		a.k.a the iso remains technically untouched ..
+#
+
+function check_dependencies
+{
+	# checking dependencies for availabilty
+	local IFS=':'
+	for program in $DEPENDENCIES;do
+		if [[ -z "$(which $program)" ]];then
+			failure "$program: Dependency not installed or unavailable .." $EXIT_DEPENDENCY
+		fi
+	done
+}
+
+### defining some constans ###
+
+declare -r EXIT_ERROR=1 EXIT_ARGS=2 EXIT_FILE=3 EXIT_LANG=4 EXIT_DEPENDENCY=5 EXIT_INTERNAL=6
+declare -r DEPENDENCIES="isoinfo:uname:chroot:sort:cut:grep:egrep:lsb_release:xauth:apt-cache:sort:ls:file:zenity:mount:umount:mktemp"
+check_dependencies
+declare -r BITS="$([[ $(uname -p) == 'x86_64' ]] && echo '64' || echo '32')"
+declare -r VERSION=1.0 SYSTEM_DESC="$(lsb_release -is) $(lsb_release -rs), $(uname -rm)"
+declare -r NUM_ARGS=6
+
+### defining some functions ###
+
+function define_langs
+{
+	LANGS_COMMAND="apt-cache pkgnames language-pack | grep -ve 'kde' -e 'gnome' -e 'base' | cut -b 15- | sort -u"
+
+	if [[ -z "$(bash -c "$LANGS_COMMAND")" ]];then
+		LANGS_COMMAND="apt-cache pkgnames language-support | egrep '^language-support-.{2,7}$' | cut -b 18- | sort -u"
+	fi
+
+	if [[ -z "$(bash -c "$LANGS_COMMAND")" ]];then
+		unset LANGS_COMMAND
+		return $EXIT_ERROR
+	fi
+	declare -r LANGS_COMMAND
+	return 0
+}
+
+function failure
+{
+	echo "$1"
+	exit ${2:$EXIT_INTERNAL}
+}
+
+function usage
+{
+	cat <<__EOF__
+	Usage:
+		Normal: $0 v$VERSION
+			arg1: iso-file.iso
+			arg2: langs_to_install
+			arg3: langs_available_at_boot
+			arg4: default_lang_at_boot
+			arg5: chroot to iso to customize
+			arg6: remove windows files
+		For Help: $0 --help
+		Using GUI: $0 --gui
+	Note that:
+		arg1: the ubuntu iso release for customizing, and a new iso will be created
+		arg2: the language packs installed (by default) in the system
+		arg3: the languages you can switch to at boot
+		arg4: the default language when booting
+			(not required if languages_available_at_boot is only one)
+		arg5: either true or false, [en/dis]ables chrooting to the iso image before finalizing ..
+			(to install software, perform tweaks, etc.)
+		arg6: either true or false, [en/dis]ables removing windows files that would normally appear under windows from a usb (ex. wubi.exe, autostart.inf, etc.)
+
+	for arg2 and arg3, languages are seperated by colons.
+
+	For example:
+		$0 /home/$USER/ubuntu-$(lsb_release -rs)-desktop-$([[ $BITS == '64' ]]&&echo 'amd64' ||echo 'i386').iso 'en:es:ar' 'ja:de:en' 'en'
+	You can view available languages by running the command: $LANGS_COMMAND
+__EOF__
+}
+
+function parse_input
+{
+	# check for special parameters
+	if [[ "$#" == 1 ]];then
+		if [[ "$1" == '--help' ]];then
+			usage
+			exit 0
+		elif [[ "$1" == '--gui' ]];then
+			run_gui
+			return
+		fi
+	fi
+	# number of args is correct
+	if [[ "$#" -ne $NUM_ARGS ]];then
+		usage
+		exit $EXIT_ARGS
+	fi
+	# iso file is valid
+	if [[ "$(ls -l "$1" | cut -b -2)" != '-r' ]];then
+		if [[ -L "$1" ]];then
+			failure "$([[ -n "$1" ]] && echo "$1" || echo "arg1"): File is a symbolic link .." $EXIT_FILE
+		else
+			failure "$([[ -n "$1" ]] && echo "$1" || echo "arg1"): File can't be accessed .." $EXIT_FILE
+		fi
+	elif [[ ! -s "$1" ]];then
+		failure "$([[ -n "$1" ]] && echo "$1" || echo "arg1"): File is empty .." $EXIT_FILE
+	elif ! file "$1" | egrep 'boot sector$' -q;then
+		failure "$([[ -n "$1" ]] && echo "$1" || echo "arg1"): File not an ISO .." $EXIT_FILE
+	elif ! isoinfo -p -i "$1" | grep -iqe 'casper' -e 'isolinux';then
+		failure "$([[ -n "$1" ]] && echo "$1" || echo "arg1"): File is not a valid .." $EXIT_FILE
+	fi
+	# language validation
+	local found1=false found2=false
+	for lang in $(bash -c "$LANGS_COMMAND"); do
+		if [[ "$lang" == "$2" ]];then
+			found1=true
+		fi
+		if [[ "$lang" == "$3" ]];then
+			found2=true
+		fi
+	done
+	if ! $found1;then
+		failure "$([[ -n "$2" ]] && echo "$2" || echo "arg2"): Language unavailable, run $LANGS_COMMAND to list all languages .." $EXIT_LANG
+	elif ! $found2;then
+		failure "$([[ -n "$3" ]] && echo "$3" || echo "arg3"): Language unavailable, run $LANGS_COMMAND to list all languages .." $EXIT_LANG
+	fi
+	local IFS=':' found3=false
+	for lang in $2;do
+		if [[ "$4" == "$lang" ]];then
+			found3=true
+			break
+		fi
+	done
+	if ! $found3;then
+		failure "$([[ -n "$4" ]] && echo "$4" || echo "arg4"): Language unavailable, run $LANGS_COMMAND to list all languages .." $EXIT_LANG
+	fi
+	# wants to cusomize ?
+	if [[ "$5" != 'true' ]] && [[ "$5" != 'false' ]];then
+		failure "$([[ -n "$5" ]] && echo "$5" || echo "arg5"): Only \"true\" or \"false\" are accepted .." $EXIT_ARGS
+	fi
+	# wants to remove win32 bindings ?
+	if [[ "$6" != 'true' ]] && [[ "$5" != 'false' ]];then
+		failure "$([[ -n "$6" ]] && echo "$6" || echo "arg6"): Only \"true\" or \"false\" are accepted .." $EXIT_ARGS
+	fi
+}
+
+function run_gui
+{
+	failure "This feature is still under maintainance, please be patient .." 0
+}
+
+function check_exit_code
+{
+	local code=$?
+	if [[ $code -ne 0 ]];then
+		exit $code
+	fi
+}
+
+function iso
+{
+	function _mount_iso
+	{
+		[[ -d "$ISO_MOUNT_DIR" ]] || mkdir "$ISO_MOUNT_DIR" || failure "Couldn't create ISO Mount Dir .."
+		echo "Mounting ISO Image .."
+		mkdir -p "$ISO_MOUNT_DIR" || failure "Couldn't create directory $ISO_MOUNT_DIR, error=$?"
+		mount -o loop "$MAIN_ISO" "$ISO_MOUNT_DIR" || failure "Cannot mount $MAIN_ISO in $ISO_MOUNT_DIR, error=$?"
+	}
+
+	function _unpack_iso
+	{
+		echo "Unpacking ISO Image .."
+		cp -a "$ISO_MOUNT_DIR" "$REMASTER_DIR" || failure "Couldn't copy files from $ISO_MOUNT_DIR to $REMASTER_DIR"
+	}
+
+	function _unmount_iso
+	{
+		if [[ ! -d "$ISO_MOUNT_DIR" ]];then
+			return $EXIT_ERROR
+		fi
+		echo "Unmounting ISO Image .."
+		umount "$ISO_MOUNT_DIR" || echo "Couldn't unmount ISO mount directory, error=$? [not fatal]"
+		rmdir "$ISO_MOUNT_DIR" || echo "Couldn't remove ISO mount directory, error=$? [not fatal]"
+		return $?
+	}
+
+	case "$1" in
+		mount ) _mount_iso;;
+		unmount ) _unmount_iso;;
+		unpack ) _unpack_iso;;
+	esac
+	local c=$?
+	unset -f _mount_iso _umount_iso _unpack_iso
+	return $c
+}
+
+function ismounted
+{
+	echo -e "$(cat /proc/mounts | awk '{print $2}')" | -q grep "^$1$"
+}
+
+function rootfs
+{
+	function _pack_rootfs
+	{
+		failure "pack_rootfs function: still under construction .."
+	}
+
+	function _unpack_rootfs
+	{ # copies r/o rootfs to r/w $REMASTER_DIR
+		echo "Unpacking SquashFS Image .."
+		cp -a "$SQUASHFS_MOUNT_DIR" "$REMASTER_DIR" || failure "Couldn't copy files from $SQUASHFS_MOUNT_DIR to $REMASTER_DIR"
+		return $?
+	}
+
+	function _mount_squashfs
+	{ # mounts squashfs
+		echo "Mounting SquashFS Image .."
+		mkdir -p "$SQUASHFS_MOUNT_DIR" || failure "Couldn't create directory $SQUASHFS_MOUNT_DIR, error=$?"
+		mount -t squashfs "$SQUASHFS_IMAGE" "$SQUASHFS_MOUNT_DIR" -o loop || failure "Couldn't mount $SQUASHFS_IMAGE in $SQUASHFS_MOUNT_DIR, error=$?"
+	}
+
+	function _unmount_squashfs
+	{ # unmounts squashfs
+		if [[ ! -d "$SQUASHFS_MOUNT_DIR" ]];then
+			return $EXIT_ERROR
+		fi
+		echo "Unmounting SquashFS Image .."
+		umount "$SQUASHFS_MOUNT_DIR" || echo "Couldn't unmount $SQUASHFS_MOUNT_DIR, error=$? [not fatal]"
+		rmdir "$SQUASHFS_MOUNT_DIR" || echo "Couldn't remove directory $SQUASHFS_MOUNT_DIR, error=$? [not fatal]"
+		return $?
+	}
+
+	function _mount_pseudofilesystems
+	{ # mounts filesystems in rootfs
+		if [[ ! -d "$REMASTER_DIR" ]];then
+			failure "Remastering root directors ($REMASTER_DIR) doesn't exist .." $EXIT_ERROR
+		fi
+		# create apt cache for chroot installations
+		echo "Creating apt cache .."
+		mkdir -p "$REMASTER_APT_CACHE" || failure "Couldn't create directory ($REMASTER_APT_CACHE) for chroot apt cache"
+		# create root home
+		echo "Creating root home .."
+		mkdir -p "$REMASTER_ROOT_HOME" || failure "Couldn't create directory ($REMASTER_ROOT_HOME) for chrooting"
+
+		# mounting directories
+		for b in "proc" "sys" "dev/pts" "tmp";do
+			_mount_directory "/$b" "$REMASTER_DIR/$b"
+		done
+		_mount_directory "$REMASTER_ROOT_HOME" "$REMASTER_DIR/root"
+		_mount_directory "$REMASTER_APT_CACHE" "$REMASTER_DIR/var/cache/apt"
+		# finalizing ..
+		local HOST_VAR_RUN GUEST_VAR_RUN
+		if [[ -d "/run" ]];then
+			HOST_VAR_RUN="/run"
+		else
+			HOST_VAR_RUN="/var/run"
+		fi
+		if [[ -d "$REMASTER_DIR/run" ]];then
+			GUEST_VAR_RUN="$REMASTER_DIR/run"
+		else
+			GUEST_VAR_RUN="$REMASTER_DIR/var/run"
+		fi
+		_mount_directory "$HOST_VAR_RUN" "$GUEST_VAR_RUN"
+	}
+
+	function _unmount_pseudofilesystems
+	{
+		[[ -f "$REMASTER_DIR" ]] || failure "Couldn't Unmount Virtual PseudoFileSystems .."
+		for i in $(mount | grep " $REMASTER_DIR/" | cut -d " " -f3 | sort -r);do
+			_unmount_directory
+		done
+	}
+
+	function _mount_directory
+	{
+		mkdir -p "$2" || failure "Couldn't create $2"
+		echo "Mounting $1 .."
+		mount --bind "$1" "$2" || failure "Couldn't bind mount $1 to $2"
+	}
+
+	function _unmount_directory
+	{
+		ismounted $1 || return 1
+		echo "Unmounting $1 .."
+		umount -l "$1" || failure "Couldn't unmount $1"
+	}
+
+	function _prepare_for_chroot
+	{ # intializes rootfs environment
+		_mount_pseudofilesystems
+
+		if [[ ! -f "$REMASTER_DIR/etc/resolv.conf" ]];then
+			echo "Copying resolv.conf .."
+			cp -f "/etc/resolv.conf" "$REMASTER_DIR/etc/resolv.conf" || echo "Couldn't copy resolv.conf [not fatal]"
+		fi
+		
+		echo "Copying fstab/mtab .."
+		if [[ -f "$REMASTER_DIR/etc/fstab" ]];then
+			mv "$REMASTER_DIR/etc/fstab" "$REMASTER_DIR/etc/fstab.uck" || failure "Couldn't move fstab, error=$?"
+		fi
+		cp -f "/etc/fstab" "$REMASTER_DIR/etc/fstab" || failure "Couldn't copy fstab, error=$?"
+		cp -f "/etc/mtab" "$REMASTER_DIR/etc/mtab" || failure "Failed to copy mtab, error=$?"
+
+		echo "Creating DBUS UUID .."
+		chroot "$REMASTER_DIR" dbus-uuidgen --ensure &>/dev/null
+
+		if $B_CUSTOMIZE;then
+			echo "Creating User Directory .."
+			chroot "$REMASTER_DIR" mkdir -p "$HOME" &>/dev/null
+			xauth extract - $DISPLAY | chroot "$REMASTER_DIR" xauth -f /root/.Xauthority merge - || failure "Couldn't merge X authorization file, error=$?"
+			xauth extract - $DISPLAY | chroot "$REMASTER_DIR" xauth merge - || failure "Couldn't merge X authorization file in user directory, error=$?"
+		fi
+		local -A vars=(
+			['initctk']="/sbin/initctl"
+			['update-grub']="/usr/sbin/update-grub"
+			['grub-probe']="/usr/sbin/grub-probe"
+		)
+		local f="$IFS"
+		local IFS=$'\n' v
+		for S in ${!vars[@]};do
+			v="${vars[$v]}"
+			echo "Deactivating $S .."
+			chroot "$REMASTER_DIR" mv  "$v" "$v.uck2_blocked"
+			chroot "$REMASTER_DIR" ln -s /bin/true "$v"
+		done
+		echo "Hacking grub-probe postinst/postrm..."
+		chroot "$REMASTER_DIR" sed -i -e "s/exec update-grub/#exec update-grub/" /etc/kernel/postinst.d/zz-update-grub
+		chroot "$REMASTER_DIR" sed -i -e "s/exec update-grub/#exec update-grub/" /etc/kernel/postrm.d/zz-update-grub
+		echo "Remembering kernel update state..."
+		local update_flags=("reboot-required" "reboot-required.pkgs" "do-not-hibernate")
+		local varrun="$REMASTER_DIR"/var/run
+		local IFS="$f"
+		for flag in $update_flags; do
+			if [[ -f "$varrun"/$flag ]];then
+				mv "$varrun/$flag" "$varrun/$flag.uck2_blocked"
+			fi
+		done
+	}
+
+	function _clean_rootfs_after_chroot
+	{
+		echo "Restoring kernel update state..."
+		local update_flags=("reboot-required" "reboot-required.pkgs" "do-not-hibernate")
+		local varrun="$REMASTER_DIR"/var/run
+		for flag in $update_flags; do
+			rm -f "$varrun/$flag"
+			if [[ -f "$varrun/$flag.uck2_blocked" ]];then
+				mv "$varrun/$flag.uck2_blocked" "$varrun/$flag"
+			fi
+		done
+
+		local -A vars=(
+			['initctk']="/sbin/initctl"
+			['update-grub']="/usr/sbin/update-grub"
+			['grub-probe']="/usr/sbin/grub-probe"
+		)
+		local f="$IFS"
+		local IFS=$'\n' v
+		for S in ${!vars[@]};do
+			v="${vars[$v]}"
+			echo "Reactivating $S .."
+			chroot "$REMASTER_DIR" mv  "$v" "$v.uck2_blocked"
+			chroot "$REMASTER_DIR" ln -s /bin/true "$v"
+		done
+		echo "Reactivating grub-probe postinst/postrm..."
+		chroot "$REMASTER_DIR" sed -i -e "s/#exec update-grub/exec update-grub/" /etc/kernel/postinst.d/zz-update-grub
+		chroot "$REMASTER_DIR" sed -i -e "s/#exec update-grub/exec update-grub/" /etc/kernel/postrm.d/zz-update-grub
+
+		if $B_CUSTOMIZE;then
+			echo "Removing $HOME in rootfs .."
+			chroot "$REMASTER_DIR" rm -rf "$HOME"
+		fi
+
+		echo "Removing generated machine uuid..."
+		chroot "$REMASTER_DIR" rm -f /var/lib/dbus/machine-id
+
+		if [[ ! -L "$REMASTER_DIR/etc/resolv.conf" ]] ; then
+			echo "Removing generated resolv.conf .."
+			chroot "$REMASTER_DIR" rm -f /etc/resolv.conf
+		fi
+		
+		echo "Removing generated fstab/mtab..."
+		chroot "$REMASTER_DIR" rm -f /etc/mtab
+		chroot "$REMASTER_DIR" rm -f /etc/fstab
+		if [[ -f "$REMASTER_DIR/etc/fstab.uck" ]] ; then
+			mv -f "$REMASTER_DIR/etc/fstab.uck" "$REMASTER_DIR/etc/fstab"
+		fi
+
+		echo "Removing crash reports..."
+		chroot "$REMASTER_DIR" rm -f /var/crash/*
+
+		_unmount_pseudofilesystems
+
+		# Need a shell to perform wildcard expansion in chroot environment!
+		#	No need to clean /tmp - was a bind mount.
+		echo "Cleaning up temporary directories..."
+		chroot "$REMASTER_DIR" sh -c "rm -rf /var/tmp/* /var/tmp/.??*"
+	}
+
+	local code=$?
+	case "$1" in
+		mount ) _mount_squashfs;;
+		unmount ) _unmount_squashfs;;
+		unpack ) _unpack_rootfs;;
+		prepare ) _prepare_for_chroot;;
+		clean ) _clean_rootfs_after_chroot;;
+		pack ) _pack_rootfs;;
+	esac
+	local f=$?
+	[[ -n "$code" ]] || code=$f
+	unset -f _mount_squashfs _unmount_squashfs _pack_rootfs _unpack_rootfs
+	unset -f _prepare_for_chroot _clean_rootfs_after_chroot
+	unset -f _mount_pseudofilesystems _unmount_pseudofilesystems
+	unset -f _mount_directory _unmount_directory
+	return $code
+}
+
+function customize
+{
+	function _remove_win32_files
+	{
+		echo "Removing Win32 Files .."
+		local -r WIN32_FILES=(
+			"autorun.inf"
+			"bin"
+			"disctree"
+			"pics"
+			"programs"
+			"start.bmp"
+			"start.exe"
+			"start.ini"
+			"ubuntu.ico"
+			"kubuntu.ico"
+			"wubi-cdboot.exe"
+			"wubi.exe"
+			"umenu.exe"
+			"usb-creator.exe"
+		)
+		for f in ${WIN32_FILES[@]};do
+			rm -rf "$REMASTER_DIR/$f"
+		done
+	}
+
+	function update_iso_locale
+	{
+		echo "Updating locale .."
+
+		cat "$ISO_REMASTER_DIR/isolinux/isolinux.cfg" | sed "s#\<append\>#append debian-installer/locale=$LIVECD_LOCALE#g" >"$NEW_FILES_DIR/isolinux.cfg"
+			RESULT=$?
+			if [ $RESULT -ne 0 ]; then
+				failure "Failed to filter $ISO_REMASTER_DIR/isolinux/isolinux.cfg into $NEW_FILES_DIR/isolinux.cfg, error=$RESULT"
+			fi
+
+			cp -a "$NEW_FILES_DIR/isolinux.cfg" "$ISO_REMASTER_DIR/isolinux/isolinux.cfg" || failure "Failed to copy $NEW_FILES_DIR/isolinux.cfg to $ISO_REMASTER_DIR/isolinux/isolinux.cfg, error=$?"
+		fi
+	}
+
+	local code
+	case "$1" in
+		remove_win32 ) _remove_win32_files;;
+		\? ) code=2;;
+	esac
+	local f=$?
+	[[ -n "$code" ]] || code=$f
+	unset -f _remove_win32_files
+	return $code
+}
+
+function main
+{
+	# require root previleges
+	if [[ "$EUID" -ne 0 ]];then
+		echo 'Run this script as root'
+		exit $EXIT_ERROR
+	fi
+	## setting variables ##
+
+	declare -r REMASTER_HOME="$(mktemp -d)" # hq
+	declare -r ISO_MOUNT_DIR="$REMASTER_HOME/remaster-iso-mount" # place to mount iso
+	declare -r REMASTER_DIR="$REMASTER_HOME/remaster-iso" # same as $ISO_MOUNT_DIR, but guaranteed not to be write-protected
+	declare -r MAIN_ISO="$1" # the ubuntu iso image
+	declare -r SQUASHFS_MOUNT_DIR="$REMASTER_HOME/remaster-root-mount" # place to mount squashfs
+	declare -r SQUASHFS_IMAGE="$REMASTER_DIR/casper/filesystem.squashfs"
+	declare -r B_CUSTOMIZE=$5
+	declare -r B_REMOVE_WIN32=$6
+	declare -r A_LANGS_INSTALL=$2
+	declare -r A_LANGS_BOOT=$3
+	declare -r DEFAULT_LANG_AT_BOOT=$4
+	declare -r REMASTER_APT_CACHE="$REMASTER_HOME/remaster-apt-cache"
+	declare -r REMASTER_ROOT_HOME="$REMASTER_HOME/remaster-root-home"
+
+	## starting work ##
+
+	echo ">> UCK2 v$VERSION on $SYSTEM_DESC"
+	echo "Starting ISO Remastering on $(date +"(%H:%M:%S) %A, %D")"
+
+	## unpacking ##
+
+	# unpacking iso
+	iso mount
+	iso unpack
+	iso unmount
+	# unpacking rootfs
+	rootfs mount
+	rootfs unpack
+	rootfs unmount
+
+	## customizing ##
+
+	# removing win32 files
+	if $B_REMOVE_WIN32;then
+		customize remove_win32
+	fi
+}
+
+if ! define_langs;then
+	failure "No languages could be found, try running: sudo apt-get update" $EXIT_ERROR
+fi
+parse_input $@
+main $@
