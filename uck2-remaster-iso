@@ -1,0 +1,130 @@
+###################################################################################
+# UCK2 - Ubuntu Customization Kit
+# Copyright (C) 2014 Amr Ayman
+
+# UCK2 is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation ..
+
+# That said, UCK2 is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with UCK2.  If not, see <http://www.gnu.org/licenses/>.
+
+# This script is only meant to be sourced in the uck2-remaster script
+# Seperated only for code clarity, not going to work outside it ..
+
+function iso
+{
+	function _mount_iso
+	{
+		[[ -d "$ISO_MOUNT_DIR" ]] || mkdir "$ISO_MOUNT_DIR" || failure "Couldn't create ISO Mount Dir .."
+		report "Mounting ISO Image .."
+		mkdir -p "$ISO_MOUNT_DIR" || failure "Couldn't create directory $ISO_MOUNT_DIR, error=$?"
+		mount -o loop "$MAIN_ISO" "$ISO_MOUNT_DIR" || failure "Cannot mount $MAIN_ISO in $ISO_MOUNT_DIR, error=$?"
+	}
+
+	function _unpack_iso
+	{
+		report "Unpacking ISO Image .."
+		cp -a "$ISO_MOUNT_DIR" "$REMASTER_DIR" || failure "Couldn't copy files from $ISO_MOUNT_DIR to $REMASTER_DIR"
+	}
+
+	function _unmount_iso
+	{
+		if [[ ! -d "$ISO_MOUNT_DIR" ]];then
+			return $EXIT_ERROR
+		fi
+		report "Unmounting ISO Image .."
+		umount "$ISO_MOUNT_DIR" || report "Couldn't unmount ISO mount directory, error=$? [not fatal]"
+		rmdir "$ISO_MOUNT_DIR" || report "Couldn't remove ISO mount directory, error=$? [not fatal]"
+		return $?
+	}
+
+	function _generate_md5
+	{
+		report "Generating MD5SUMs for newly created ISO .."
+		md5sum "$NEW_ISO" > "$NEW_ISO.md5" || report "Couldn't generate md5 for iso [not fatal]"
+	}
+
+	function _pack_iso
+	{
+		[[ -d "$REMASTER_DIR" ]] || failure "ISO Remastering directory ($REMASTER_DIR) not found .." $EXIT_ERROR
+
+		EXCLUDED_FROM_MD5="./isolinux/isolinux.bin ./isolinux/boot.cat ./md5sum.txt ./.checksum.md5 ./manifest.diff"
+		EXCLUDED_FROM_MD5_EXPRESSION=$(echo $EXCLUDED_FROM_MD5 | tr ' ' '|')
+		report "Moving SquashFS (the filesystem) .."
+		mv "$NEW_SQUASHFS_IMAGE" "$REMASTER_DIR/casper"
+		report "Updating MD5SUMs .."
+		pushd "$REMASTER_DIR"
+		find . -type f -print0 | grep --null-data -v -E "$EXCLUDED_FROM_MD5_EXPRESSION" | xargs -0 md5sum | tee md5sum.txt | sed 's/ \.\// /g' >.checksum.md5
+		popd
+
+		report "Packing ISO Image .."
+		report "ISO Description: \"$ISO_DESCRIPTION\""
+		
+	if [[ "$1" == "ppc" ]]; then
+		genisoimage -o "$NEW_ISO" \
+			-p "Ubuntu Customization Kit - http://uck.sf.net" \
+			-probe -map "hfs.map" -chrp-boot -iso-level 2 \
+			-part -no-desktop -r --netatalk -hfs \
+			-hfs-bless "$REMASTER_DIR/install" \
+			-x "$REMASTER_DIR/casper/manifest.diff" \
+			-V "$ISO_DESCRIPTION" \
+			-joliet-long -input-charset utf-8 \
+			"$REMASTER_DIR"
+	elif [[ "$1" == "x86_64" ]]; then
+		genisoimage -o "$NEW_ISO" \
+			-b "isolinux/isolinux.bin" -c "isolinux/boot.cat" \
+			-p "Ubuntu Customization Kit - http://uck.sf.net" \
+			-no-emul-boot -boot-load-size 4 -boot-info-table \
+			-V "$ISO_DESCRIPTION" -cache-inodes -r -J -l \
+			-x "$REMASTER_DIR/casper/manifest.diff" \
+			-joliet-long -input-charset utf-8 \
+			"$REMASTER_DIR"
+	elif [[ "$1" == "ia64" ]]; then
+		genisoimage -o "$NEW_ISO" \
+			-b "isolinux/isolinux.bin" -c "isolinux/boot.cat" \
+			-no-emul-boot -V "$ISO_DESCRIPTION" -J -r \
+			-x "$REMASTER_DIR/casper/manifest.diff" \
+			-joliet-long -input-charset utf-8 \
+			"$REMASTER_DIR"
+	else
+		genisoimage -o "$NEW_ISO" \
+			-b "isolinux/isolinux.bin" -c "isolinux/boot.cat" \
+			-p "Ubuntu Customization Kit - http://uck.sf.net" \
+			-no-emul-boot -boot-load-size 4 -boot-info-table \
+			-V "$ISO_DESCRIPTION" -cache-inodes -r -J -l \
+			-x "$REMASTER_DIR/casper/manifest.diff" \
+			-joliet-long -input-charset utf-8 \
+			"$REMASTER_DIR"
+	fi
+
+		local res=$?
+		[[ $res -eq 0 ]] || failure "Couldn't pack ISO Image, error=$res"
+		if $B_HYBRID;then
+			if ! check_dependencies isohybrid e;then
+				failure "You asked for a hybrid ISO but the isohybrid command wasn't found .." $EXIT_DEPENDENCY
+			fi
+			report "Making your ISO hybrid .."
+			isohybrid "$NEW_ISO"
+			res=$?
+			[[ $res -eq 0 ]] || failure "Couldn't pack ISO Image, error=$res"
+		fi
+		_generate_md5
+	}
+
+	while [[ -n "$1" ]];do
+		case "$1" in
+			mount ) _mount_iso;;
+			unmount ) _unmount_iso;;
+			unpack ) _unpack_iso;;
+			pack ) _pack_iso;;
+		esac
+		shift
+	done
+	unset -f _mount_iso _umount_iso _unpack_iso
+}
