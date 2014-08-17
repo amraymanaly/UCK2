@@ -1,0 +1,271 @@
+###################################################################################
+# UCK2 - Ubuntu Customization Kit
+# Copyright (C) 2014 Amr Ayman
+
+# UCK2 is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation ..
+
+# That said, UCK2 is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with UCK2.  If not, see <http://www.gnu.org/licenses/>.
+
+# This script is only meant to be sourced in the uck2-remaster script
+# Seperated only for code clarity, not going to work outside it ..
+
+function rootfs
+{
+	function _chroot
+	{
+		chroot "$SQUASHFS_REMASTER_DIR" "$@"
+	}
+
+	function _pack_rootfs
+	{
+
+		[[ -d "$REMASTER_DIR" ]] || failure "Remastering Directory ($REMASTER_DIR) not found .." $EXIT_ERROR
+		report "Packing RootFS .."
+		report "Updating files lists .."
+		_chroot dpkg-query -W --showformat='${Package} ${Version}\n' > "$REMASTER_DIR/casper/filesystem.manifest" || failure "Couldn't update filesystem.manifest, error=$?"
+		if [[ -f "$REMASTER_DIR/casper/manifest.diff" ]]; then
+			#stripping version number from manifest 
+			cat "$REMASTER_DIR/casper/filesystem.manifest" | cut -d ' ' -f 1 > "$REMASTER_DIR/filesystem.manifest.tmp"
+			# can't trap errors with diff because of its return codes
+			diff --unchanged-group-format='' "$REMASTER_DIR/filesystem.manifest.tmp" "$REMASTER_DIR/casper/manifest.diff" > "$REMASTER_DIR/filesystem.manifest-desktop.tmp"
+			# building the right manifest-desktop file
+			_chroot dpkg-query -W --showformat='${Package} ${Version}\n' `cat "$REMASTER_DIR/filesystem.manifest-desktop.tmp"` | egrep '.+ .+' > "$REMASTER_DIR/casper/filesystem.manifest-desktop"
+			# removing tmp files
+			rm "$REMASTER_DIR/filesystem.manifest.tmp" "$REMASTER_DIR/filesystem.manifest-desktop.tmp"
+		else
+			cp "$REMASTER_DIR/casper/filesystem.manifest" "$REMASTER_DIR/casper/filesystem.manifest-desktop" || failure "Couldn't copy $REMASTER_DIR/casper/filesystem.manifest to $REMASTER_DIR/casper/filesystem.manifest-desktop"
+		fi
+
+		report "Packing SquashFS Image .."
+		if [[ -e "$MAIN_SQUASHFS_IMAGE" ]]; then
+			rm -f "$MAIN_SQUASHFS_IMAGE" || failure "Cannot remove $MAIN_SQUASHFS_IMAGE to make room for created squashfs image, error=$?"
+		fi
+
+		#if mksquashfs version => 4.1 and guest's kernel => 2.6.30 we can enable xz compression
+		local -r SQUASHFS_TOOLS_VERSION="$(dpkg-query -p squashfs-tools | grep Version | cut -d '+' -f1 | cut -d ':' -f3)"
+		local -r GUEST_KERNEL_VERSION="$(_chroot bash -c "ls /boot/config-* | sed 's/.*config-//' | cut -d '-' -f1 | sort -r | head -n1")"
+		if [[ "$SQUASHFS_TOOLS_VERSION" == '4.1' ]] || # == 4.1
+			[[ "$(echo -e "$SQUASHFS_TOOLS_VERSION\n4.1"| sort | head -n1)" == '4.1' ]] # > 4.1
+			then
+			if [[ "$(echo -e "$GUEST_KERNEL_VERSION\n2.6.30" | sort | head -n1)" == '2.6.30' ]] # > 2.6.30
+				then
+				report "squashfs-tools (version) >= 4.1, guest kernel (version) >= 2.6.30: Enabling XZ compression for SquashFS .."
+				local EXTRA_OPTS="-comp xz"
+			fi
+		fi
+		mkdir -p "$NEW_FILES_DIR" || failure "Couldn't Create New ISO Directory ($NEW_FILES_DIR) .."
+		mksquashfs "$SQUASHFS_REMASTER_DIR" "$NEW_SQUASHFS_IMAGE" $EXTRA_OPTS ||
+			failure "Failed to create squashfs image from $SQUASHFS_REMASTER_DIR, error=$?"
+	}
+
+	function _unpack_rootfs
+	{ # copies r/o rootfs to r/w $SQUASHFS_REMASTER_DIR
+		report "Unpacking SquashFS Image .."
+		cp -a "$SQUASHFS_MOUNT_DIR" "$SQUASHFS_REMASTER_DIR" || failure "Couldn't copy files from $SQUASHFS_MOUNT_DIR to $SQUASHFS_REMASTER_DIR"
+	}
+
+	function _mount_squashfs
+	{ # mounts squashfs
+		report "Mounting SquashFS Image .."
+		mkdir -p "$SQUASHFS_MOUNT_DIR" || failure "Couldn't create directory $SQUASHFS_MOUNT_DIR, error=$?"
+		mount -t squashfs "$MAIN_SQUASHFS_IMAGE" "$SQUASHFS_MOUNT_DIR" -o loop || failure "Couldn't mount $MAIN_SQUASHFS_IMAGE in $SQUASHFS_MOUNT_DIR, error=$?"
+	}
+
+	function _unmount_squashfs
+	{ # unmounts squashfs
+		if [[ ! -d "$SQUASHFS_MOUNT_DIR" ]];then
+			return $EXIT_ERROR
+		fi
+		report "Unmounting SquashFS Image .."
+		umount "$SQUASHFS_MOUNT_DIR" || report "Couldn't unmount $SQUASHFS_MOUNT_DIR, error=$? [not fatal]"
+		rmdir "$SQUASHFS_MOUNT_DIR" || report "Couldn't remove directory $SQUASHFS_MOUNT_DIR, error=$? [not fatal]"
+	}
+
+	function _mount_pseudofilesystems
+	{ # mounts filesystems in rootfs
+		if [[ ! -d "$REMASTER_DIR" ]];then
+			failure "Remastering root directors ($REMASTER_DIR) doesn't exist .." $EXIT_ERROR
+		fi
+		# create apt cache for chroot installations
+		report "Creating apt cache .."
+		mkdir -p "$REMASTER_APT_CACHE" || failure "Couldn't create directory ($REMASTER_APT_CACHE) for chroot apt cache"
+		# create root home
+		report "Creating root home .."
+		mkdir -p "$REMASTER_ROOT_HOME" || failure "Couldn't create directory ($REMASTER_ROOT_HOME) for chrooting"
+
+		# mounting directories
+		for b in "proc" "sys" "dev/pts" "tmp";do
+			_mount_directory "/$b" "$SQUASHFS_REMASTER_DIR/$b"
+		done
+		_mount_directory "$REMASTER_ROOT_HOME" "$SQUASHFS_REMASTER_DIR/root"
+		_mount_directory "$REMASTER_APT_CACHE" "$SQUASHFS_REMASTER_DIR/var/cache/apt"
+		# finalizing ..
+		local HOST_VAR_RUN GUEST_VAR_RUN
+		if [[ -d "/run" ]];then
+			HOST_VAR_RUN="/run"
+		else
+			HOST_VAR_RUN="/var/run"
+		fi
+		if [[ -d "$SQUASHFS_REMASTER_DIR/run" ]];then
+			GUEST_VAR_RUN="$SQUASHFS_REMASTER_DIR/run"
+		else
+			GUEST_VAR_RUN="$SQUASHFS_REMASTER_DIR/var/run"
+		fi
+		_mount_directory "$HOST_VAR_RUN" "$GUEST_VAR_RUN"
+	}
+
+	function _unmount_pseudofilesystems
+	{
+		[[ -d "$SQUASHFS_REMASTER_DIR" ]] || failure "Couldn't Unmount Virtual PseudoFileSystems .."
+		for i in $(mount | grep " $SQUASHFS_REMASTER_DIR/" | cut -d " " -f3 | sort -r);do
+			_unmount_directory "$i"
+		done
+	}
+
+	function _mount_directory
+	{
+		mkdir -p "$2" || failure "Couldn't create $2"
+		report "Mounting $1 .."
+		mount --bind "$1" "$2" || failure "Couldn't bind mount $1 to $2"
+	}
+
+	function _unmount_directory
+	{
+		ismounted $1 || return 1
+		report "Unmounting $1 .."
+		umount -l "$1" || failure "Couldn't unmount $1"
+	}
+
+	function _prepare_for_chroot
+	{ # intializes rootfs environment
+		_mount_pseudofilesystems
+
+		if [[ ! -f "$SQUASHFS_REMASTER_DIR/etc/resolv.conf" ]];then
+			report "Copying resolv.conf .."
+			cp -f "/etc/resolv.conf" "$SQUASHFS_REMASTER_DIR/etc/resolv.conf" || report "Couldn't copy resolv.conf [not fatal]"
+		fi
+
+		report "Copying fstab/mtab .."
+		if [[ -f "$SQUASHFS_REMASTER_DIR/etc/fstab" ]];then
+			mv "$SQUASHFS_REMASTER_DIR/etc/fstab" "$SQUASHFS_REMASTER_DIR/etc/fstab.uck" || failure "Couldn't move fstab, error=$?"
+		fi
+		cp -f "/etc/fstab" "$SQUASHFS_REMASTER_DIR/etc/fstab" || failure "Couldn't copy fstab, error=$?"
+		cp -f "/etc/mtab" "$SQUASHFS_REMASTER_DIR/etc/mtab" || failure "Failed to copy mtab, error=$?"
+
+		report "Creating DBUS UUID .."
+		_chroot dbus-uuidgen --ensure
+
+		if $B_CUSTOMIZE;then
+			report "Creating User Directory .."
+			_chroot mkdir -p "$HOME" &>/dev/null
+		fi
+		local -A vars=(
+			['initctl']="/sbin/initctl"
+			['update-grub']="/usr/sbin/update-grub"
+			['grub-probe']="/usr/sbin/grub-probe"
+		)
+		local f="$IFS"
+		local IFS=$'\n' v S
+		for S in ${!vars[@]};do
+			v="${vars[$S]}"
+			report "Deactivating $S .."
+			_chroot mv  "$v" "$v.uck2_blocked"
+			_chroot ln -s /bin/true "$v"
+		done
+		report "Hacking grub-probe postinst/postrm..."
+		_chroot sed -i -e "s/exec update-grub/#exec update-grub/" /etc/kernel/postinst.d/zz-update-grub
+		_chroot sed -i -e "s/exec update-grub/#exec update-grub/" /etc/kernel/postrm.d/zz-update-grub
+		report "Remembering kernel update state..."
+		local update_flags=("reboot-required" "reboot-required.pkgs" "do-not-hibernate")
+		local varrun="$SQUASHFS_REMASTER_DIR"/var/run
+		local IFS="$f"
+		for flag in $update_flags; do
+			if [[ -f "$varrun"/$flag ]];then
+				mv "$varrun/$flag" "$varrun/$flag.uck2_blocked"
+			fi
+		done
+	}
+
+	function _clean_rootfs_after_chroot
+	{
+		report "Restoring kernel update state..."
+		local update_flags=("reboot-required" "reboot-required.pkgs" "do-not-hibernate")
+		local varrun="$SQUASHFS_REMASTER_DIR"/var/run
+		for flag in $update_flags; do
+			rm -f "$varrun/$flag"
+			if [[ -f "$varrun/$flag.uck2_blocked" ]];then
+				mv "$varrun/$flag.uck2_blocked" "$varrun/$flag"
+			fi
+		done
+
+		local -A vars=(
+			['initctk']="/sbin/initctl"
+			['update-grub']="/usr/sbin/update-grub"
+			['grub-probe']="/usr/sbin/grub-probe"
+		)
+		local v
+		for v in ${!vars[@]};do
+			report "Reactivating $v .."
+			_chroot mv  "${vars[$v]}" "${vars[$v]}.uck2_blocked"
+			_chroot ln -s /bin/true "${vars[$v]}"
+		done
+		report "Reactivating grub-probe postinst/postrm..."
+		_chroot sed -i -e "s/#exec update-grub/exec update-grub/" /etc/kernel/postinst.d/zz-update-grub
+		_chroot sed -i -e "s/#exec update-grub/exec update-grub/" /etc/kernel/postrm.d/zz-update-grub
+
+		if $B_CUSTOMIZE;then
+			report "Removing $HOME in rootfs .."
+			_chroot rm -rf "$HOME"
+		fi
+
+		report "Removing generated machine uuid..."
+		_chroot rm -f /var/lib/dbus/machine-id
+
+		if [[ ! -L "$SQUASHFS_REMASTER_DIR/etc/resolv.conf" ]] ; then
+			report "Removing generated resolv.conf .."
+			_chroot rm -f /etc/resolv.conf
+		fi
+		
+		report "Removing generated fstab/mtab..."
+		_chroot rm -f /etc/mtab
+		_chroot rm -f /etc/fstab
+		if [[ -f "$SQUASHFS_REMASTER_DIR/etc/fstab.uck" ]] ; then
+			mv -f "$SQUASHFS_REMASTER_DIR/etc/fstab.uck" "$SQUASHFS_REMASTER_DIR/etc/fstab"
+		fi
+
+		report "Removing crash reports..."
+		_chroot rm -f /var/crash/*
+
+		_unmount_pseudofilesystems
+
+		# Need a shell to perform wildcard expansion in chroot environment!
+		#	No need to clean /tmp - was a bind mount.
+		report "Cleaning up temporary directories..."
+		_chroot bash -c 'rm -rf /var/tmp/*' # bash -c needed, to prevent star expansion
+	}
+
+	while [[ -n "$1" ]];do
+		case "$1" in
+			mount ) _mount_squashfs;;
+			unmount ) _unmount_squashfs;;
+			unpack ) _unpack_rootfs;;
+			prepare ) _prepare_for_chroot;;
+			clean ) _clean_rootfs_after_chroot;;
+			pack ) _pack_rootfs;;
+			chroot ) notify-send 'We need you here ..' 'Chrooting ISO at the terminal ..';_chroot;;
+		esac
+		shift
+	done
+	unset -f _mount_squashfs _unmount_squashfs _pack_rootfs _unpack_rootfs
+	unset -f _prepare_for_chroot _clean_rootfs_after_chroot _chroot
+	unset -f _mount_pseudofilesystems _unmount_pseudofilesystems
+	unset -f _mount_directory _unmount_directory
+}
